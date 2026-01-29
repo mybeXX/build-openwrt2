@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- 1. 工具链缓存处理 (用于加速 GitHub Actions 再次编译) ---
+# --- 1. 工具链缓存处理 ---
 if [[ "$REBUILD_TOOLCHAIN" = 'true' ]]; then
     cd $OPENWRT_PATH
     sed -i 's/ $(tool.*\/stamp-compile)//' Makefile
@@ -32,38 +32,36 @@ git_clone() {
     mkdir -p package/A && mv -f "$target_dir" "package/A/"
 }
 
-# --- 3. 插件拉取与源码注入 (针对 mufeng05 TurboACC 优化) ---
+# --- 3. 插件拉取与源码注入 ---
 add_custom_packages() {
     echo "📦 正在注入极简插件与 TurboACC..."
-    
-    # 执行 mufeng05 的脚本：它会自动修改 feeds 并拉取正确版本的 turboacc
     curl -sSL https://raw.githubusercontent.com/mufeng05/turboacc/main/add_turboacc.sh -o add_turboacc.sh && bash add_turboacc.sh
 
-    # 拉取其他你需要的极简插件
     git_clone https://github.com/sirpdboy/luci-app-ddns-go
     git_clone https://github.com/brvphoenix/luci-app-wrtbwmon
     git_clone https://github.com/brvphoenix/wrtbwmon
     git_clone https://github.com/jerrykuku/luci-theme-argon
     git_clone https://github.com/jerrykuku/luci-app-argon-config
 
-    # 修复 Makefile 路径依赖，防止编译报错
     find package/A -type f -name "Makefile" | xargs sed -i \
         -e 's?\.\./\.\./\(lang\|devel\)?$(TOPDIR)/feeds/packages/\1?' \
         -e 's?\.\./\.\./luci.mk?$(TOPDIR)/feeds/luci/luci.mk?'
 }
 
-# --- 4. 个人设置 (IP 10.0.0.1 / 空密码 / 禁用 IPv6) ---
+# --- 4. 个人设置 (读取界面输入的 IP) ---
 apply_custom_settings() {
-    # 1. 强制设置默认 IP 为 10.0.0.1
-    sed -i 's/192.168.1.1/10.0.0.1/g' package/base-files/files/bin/config_generate
+    # 使用界面输入的 IP_ADDRESS，如果没有输入则默认 10.0.0.1
+    local default_ip=${IP_ADDRESS:-10.0.0.1}
+    echo "🌐 设置管理 IP 为: $default_ip"
+    sed -i "s/192.168.1.1/$default_ip/g" package/base-files/files/bin/config_generate
 
-    # 2. 彻底清除 root 密码 (实现空密码登录)
+    # 彻底清除 root 密码 (实现空密码登录)
     sed -i 's/root:[^:]*:/root::/' package/base-files/files/etc/shadow
 
-    # 3. TTYD 终端免密登录
+    # TTYD 终端免密登录
     [ -f feeds/packages/utils/ttyd/files/ttyd.config ] && sed -i 's|/bin/login|/bin/login -f root|g' feeds/packages/utils/ttyd/files/ttyd.config
 
-    # 4. 内核层面彻底禁用 IPv6 (防止后台产生没用的 IPv6 进程和报错)
+    # 彻底禁用 IPv6
     echo "net.ipv6.conf.all.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
     echo "net.ipv6.conf.default.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
     echo "net.ipv6.conf.lo.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
@@ -86,10 +84,17 @@ update_install_feeds() {
 }
 
 update_config_file() {
-    # 将你的 .config 复制到编译目录
-    [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cp -f "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+    # 彻底锁定 x86_64 架构，防止跑偏
+    cat > .config <<EOF
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_x86_64_DEVICE_generic=y
+EOF
+
+    # 追加配置文件
+    [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cat "$GITHUB_WORKSPACE/$CONFIG_FILE" >> .config
     
-    # 再次确认写入关键项，防止 .config 手潮漏掉
+    # 强制开启 TurboACC 子项
     {
         echo "CONFIG_PACKAGE_luci-app-turboacc=y"
         echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_OFFLOADING=y"
@@ -98,10 +103,12 @@ update_config_file() {
         echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE=y"
     } >> .config
     
-    # 强制 rootfs 大小
-    [ "$PART_SIZE" ] && sed -i "/ROOTFS_PARTSIZE/d" .config && echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$PART_SIZE" >> .config
+    # 强制 rootfs 大小 (读取界面输入的 PART_SIZE)
+    local size=${PART_SIZE:-800}
+    echo "💾 设置分区大小为: ${size}MB"
+    sed -i "/ROOTFS_PARTSIZE/d" .config
+    echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$size" >> .config
     
-    # 这一步会自动处理所有依赖关系
     make defconfig >/dev/null 2>&1
 }
 
@@ -111,11 +118,8 @@ main() {
     status_info "更新&安装插件 Feeds" update_install_feeds
     status_info "添加极简插件及注入 TurboACC" add_custom_packages
     status_info "加载个人设置 (IP/密码/IPv6)" apply_custom_settings
-    status_info "生成最终配置文件" update_config_file
+    status_info "锁定架构并生成最终配置" update_config_file
     echo "$(color cg "✅ 固件定制脚本运行完成！")"
-    echo "----------------------------------------"
-    echo "IP: 10.0.0.1  |  Password: (NONE)"
-    echo "----------------------------------------"
 }
 
 main "$@"
