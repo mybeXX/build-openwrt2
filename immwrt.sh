@@ -11,60 +11,66 @@ fi
 
 [ -d "$GITHUB_WORKSPACE/output" ] || mkdir -p "$GITHUB_WORKSPACE/output"
 
-# --- 2. 工具函数 ---
-color() {
-    case "$1" in
-        cr) echo -e "\e[1;31m${2}\e[0m" ;; cg) echo -e "\e[1;32m${2}\e[0m" ;;
-        cy) echo -e "\e[1;33m${2}\e[0m" ;; cp) echo -e "\e[1;35m${2}\e[0m" ;;
-    esac
-}
-
-status_info() {
-    local task_name="$1" begin_time=$(date +%s) exit_code
-    shift; "$@"; exit_code=$?
-    printf "%s %-53s [ %s ] ==> 用时 %s 秒\n" "$(color cy "⏳ $task_name")" "" "$( [[ "$exit_code" -eq 0 ]] && color cg ✔ || color cr ✖ )" "$(($(date +%s) - begin_time))"
-}
-
-git_clone() {
-    local repo_url=$1; local target_dir=${2:-${repo_url##*/}}
-    git clone -q --depth=1 "$repo_url" "$target_dir" 2>/dev/null
-    rm -rf "$target_dir"/{.git*,README*.md,LICENSE}
-    mkdir -p package/A && mv -f "$target_dir" "package/A/"
-}
-
-# --- 3. 插件拉取与源码注入 ---
+# --- 2. 插件拉取与注入 ---
 add_custom_packages() {
-    echo "📦 正在注入极简插件与 TurboACC..."
+    # 注入 TurboACC
     curl -sSL https://raw.githubusercontent.com/mufeng05/turboacc/main/add_turboacc.sh -o add_turboacc.sh && bash add_turboacc.sh
 
-    git_clone https://github.com/sirpdboy/luci-app-ddns-go
-    git_clone https://github.com/brvphoenix/luci-app-wrtbwmon
-    git_clone https://github.com/brvphoenix/wrtbwmon
-    git_clone https://github.com/jerrykuku/luci-theme-argon
-    git_clone https://github.com/jerrykuku/luci-app-argon-config
-
-    find package/A -type f -name "Makefile" | xargs sed -i \
-        -e 's?\.\./\.\./\(lang\|devel\)?$(TOPDIR)/feeds/packages/\1?' \
-        -e 's?\.\./\.\./luci.mk?$(TOPDIR)/feeds/luci/luci.mk?'
+    # 拉取其他插件函数 (为了简洁，直接列出核心逻辑)
+    mkdir -p package/A
+    git clone --depth=1 https://github.com/sirpdboy/luci-app-ddns-go package/A/luci-app-ddns-go
+    git clone --depth=1 https://github.com/brvphoenix/luci-app-wrtbwmon package/A/luci-app-wrtbwmon
+    git clone --depth=1 https://github.com/brvphoenix/wrtbwmon package/A/wrtbwmon
+    git clone --depth=1 https://github.com/jerrykuku/luci-theme-argon package/A/luci-theme-argon
+    git clone --depth=1 https://github.com/jerrykuku/luci-app-argon-config package/A/luci-app-argon-config
 }
 
-# --- 4. 个人设置 (读取界面输入的 IP) ---
+# --- 3. 个人设置 (动态读取界面输入) ---
 apply_custom_settings() {
-    # 使用界面输入的 IP_ADDRESS，如果没有输入则默认 10.0.0.1
-    local default_ip=${IP_ADDRESS:-10.0.0.1}
-    echo "🌐 设置管理 IP 为: $default_ip"
-    sed -i "s/192.168.1.1/$default_ip/g" package/base-files/files/bin/config_generate
+    # 读取界面上的 "设置默认IP地址" (变量名通常对应 workflow 中的 input id)
+    # 如果读取不到界面输入，则默认使用 10.0.0.1
+    local TARGET_IP=${IP_ADDR:-10.0.0.1}
+    echo "⚙️  正在将管理 IP 修改为: $TARGET_IP"
+    sed -i "s/192.168.1.1/$TARGET_IP/g" package/base-files/files/bin/config_generate
 
-    # 彻底清除 root 密码 (实现空密码登录)
+    # 密码设置为空
     sed -i 's/root:[^:]*:/root::/' package/base-files/files/etc/shadow
 
-    # TTYD 终端免密登录
+    # TTYD 免密登录
     [ -f feeds/packages/utils/ttyd/files/ttyd.config ] && sed -i 's|/bin/login|/bin/login -f root|g' feeds/packages/utils/ttyd/files/ttyd.config
 
-    # 彻底禁用 IPv6
+    # 禁用 IPv6
     echo "net.ipv6.conf.all.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
     echo "net.ipv6.conf.default.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
-    echo "net.ipv6.conf.lo.disable_ipv6=1" >> package/base-files/files/etc/sysctl.conf
+}
+
+# --- 4. 架构锁定与分区大小 ---
+update_config_file() {
+    # 彻底清空并重写架构配置，防止选错机型
+    cat > .config <<EOF
+CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_x86_64_DEVICE_generic=y
+EOF
+
+    # 合并你上传的配置文件
+    [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cat "$GITHUB_WORKSPACE/$CONFIG_FILE" >> .config
+    
+    # 强制注入 TurboACC 子项
+    {
+        echo "CONFIG_PACKAGE_luci-app-turboacc=y"
+        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_OFFLOADING=y"
+        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_BBR_CCA=y"
+    } >> .config
+
+    # 读取界面上的 "设置rootfs大小" (PART_SIZE)
+    # 注意：这里需要确保它是纯数字
+    local TARGET_SIZE=${PART_SIZE:-800}
+    echo "💾 正在设置固件分区大小为: ${TARGET_SIZE}MB"
+    sed -i "/ROOTFS_PARTSIZE/d" .config
+    echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$TARGET_SIZE" >> .config
+
+    make defconfig >/dev/null 2>&1
 }
 
 # --- 5. 编译环境主流程 ---
@@ -78,48 +84,14 @@ clone_source_code() {
     echo "OPENWRT_PATH=$PWD" >>$GITHUB_ENV
 }
 
-update_install_feeds() {
+main() {
+    clone_source_code
     ./scripts/feeds update -a >/dev/null
     ./scripts/feeds install -a >/dev/null
-}
-
-update_config_file() {
-    # 彻底锁定 x86_64 架构，防止跑偏
-    cat > .config <<EOF
-CONFIG_TARGET_x86=y
-CONFIG_TARGET_x86_64=y
-CONFIG_TARGET_x86_64_DEVICE_generic=y
-EOF
-
-    # 追加配置文件
-    [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && cat "$GITHUB_WORKSPACE/$CONFIG_FILE" >> .config
-    
-    # 强制开启 TurboACC 子项
-    {
-        echo "CONFIG_PACKAGE_luci-app-turboacc=y"
-        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_OFFLOADING=y"
-        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_BBR_CCA=y"
-        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_PDNSD=y"
-        echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE=y"
-    } >> .config
-    
-    # 强制 rootfs 大小 (读取界面输入的 PART_SIZE)
-    local size=${PART_SIZE:-800}
-    echo "💾 设置分区大小为: ${size}MB"
-    sed -i "/ROOTFS_PARTSIZE/d" .config
-    echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$size" >> .config
-    
-    make defconfig >/dev/null 2>&1
-}
-
-# --- 6. 执行入口 ---
-main() {
-    status_info "拉取编译源码" clone_source_code
-    status_info "更新&安装插件 Feeds" update_install_feeds
-    status_info "添加极简插件及注入 TurboACC" add_custom_packages
-    status_info "加载个人设置 (IP/密码/IPv6)" apply_custom_settings
-    status_info "锁定架构并生成最终配置" update_config_file
-    echo "$(color cg "✅ 固件定制脚本运行完成！")"
+    add_custom_packages
+    apply_custom_settings
+    update_config_file
+    echo "✅ 动态配置完成，准备开始编译..."
 }
 
 main "$@"
