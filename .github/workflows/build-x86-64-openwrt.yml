@@ -31,7 +31,7 @@ on:
       partsize:
         description: '设置rootfs大小 (MB)'
         required: false
-        default: '800'
+        default: '500'
 
       release:
         description: '上传到 Releases'
@@ -72,7 +72,6 @@ jobs:
           else
             REPO_URL="https://github.com/coolsnowwolf/lede"
           fi
-          # 尝试克隆指定版本，增加 --tags 确保能找到具体版本号
           git clone --depth 1 --tags -b $REPO_BRANCH $REPO_URL /workdir/openwrt
           echo "OPENWRT_PATH=/workdir/openwrt" >> $GITHUB_ENV
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
@@ -80,12 +79,10 @@ jobs:
       - name: Get Commit Data
         run: |
           cd $OPENWRT_PATH
-          # 抓取当前源码的元数据，用于填充 Release 页面
           echo "COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an')" >> $GITHUB_ENV
           echo "COMMIT_DATE=$(git log -1 --pretty=format:'%ad')" >> $GITHUB_ENV
           echo "COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')" >> $GITHUB_ENV
           echo "COMMIT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
-          # 提取 Makefile 中的内核版本号
           echo "KERNEL_VERSION=$(grep -oP '(?<=KERNEL_PATCHVER:=).*' target/linux/x86/Makefile || echo "Unknown")" >> $GITHUB_ENV
 
       - name: Load Custom Configuration
@@ -96,9 +93,9 @@ jobs:
           chmod +x $DIY_SCRIPT && ./$DIY_SCRIPT
           
           cd $OPENWRT_PATH
-          # 自动修改 800MB rootfs 空间
+          # 自动修改 rootfs 空间
           sed -i "s/CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=$PART_SIZE/" .config
-          # 自动修改默认 IP 地址
+          # 自动修改默认 IP
           sed -i "s/192.168.1.1/$IP_ADDRESS/g" package/base-files/files/bin/config_generate
 
       - name: Compile Firmware
