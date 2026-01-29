@@ -1,30 +1,6 @@
 name: build x86/64 openwrt
 
 on:
-  workflow_call:
-    inputs:
-      source:
-        required: true
-        type: string
-      target:
-        required: true
-        type: string
-      ip_address:
-        required: true
-        type: string
-      partsize:
-        required: true
-        type: string
-      toolchain:
-        required: true
-        type: string
-      artifact:
-        required: true
-        type: string
-      release:
-        required: true
-        type: string
-
   workflow_dispatch:
     inputs:
       source:
@@ -34,8 +10,14 @@ on:
         type: choice
         options: ['immwrt', 'lean']
 
+      version:
+        description: '输入版本号 (例如: 24.10.4, v23.05.7, 或 master)'
+        required: true
+        default: '24.10.4'
+        type: string
+
       target:
-        description: '选择要编译的机型'
+        description: '选择机型'
         required: true
         default: 'x86-64'
         type: choice
@@ -44,27 +26,15 @@ on:
       ip_address:
         description: '设置默认IP地址'
         required: false
-        default: '10.0.0.2'
+        default: '10.0.0.1'
 
       partsize:
-        description: '设置rootfs大小'
+        description: '设置rootfs大小 (MB)'
         required: false
         default: '800'
 
-      toolchain:
-        description: '使用toolchain缓存'
-        required: false
-        default: true
-        type: boolean
-
-      artifact:
-        description: '上传固件到Artifact'
-        required: false
-        default: true
-        type: boolean
-
       release:
-        description: '上传固件到Releases'
+        description: '上传到 Releases'
         required: false
         default: true
         type: boolean
@@ -77,159 +47,88 @@ jobs:
     env:
       IP_ADDRESS: ${{inputs.ip_address}}
       PART_SIZE: ${{inputs.partsize}}
-      TOOLCHAIN: ${{inputs.toolchain}}
-      CONFIG_FILE: configs/${{inputs.target}}-${{inputs.source}}.config
       DIY_SCRIPT: ${{inputs.source}}.sh
-      RELEASE_TAG: ${{inputs.target}}-${{inputs.source}}
-      UPLOAD_ARTIFACT: ${{inputs.artifact}}
-      UPLOAD_RELEASE: ${{inputs.release}}
+      REPO_BRANCH: ${{inputs.version}}
       TZ: Asia/Shanghai
 
     steps:
       - name: Checkout
         uses: actions/checkout@main
 
-      - name: Check Server Performance
-        run: |
-          echo "警告⚠"
-          echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
-          echo -e "已知CPU型号(降序): 7763，8370C，8272CL，8171M，E5-2673\n"
-          echo "==========================CPU信息=========================="
-          echo "CPU物理数量: $(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
-          echo "CPU线程数量: $(nproc)"
-          echo -e "CPU型号信息:$(cat /proc/cpuinfo | grep -m1 name | awk -F: '{print $2}')\n"
-          echo "==========================内存信息=========================="
-          echo "已安装内存详细信息:"
-          echo -e "$(sudo lshw -short -C memory | grep GiB)\n"
-          echo "==========================硬盘信息=========================="
-          echo "硬盘数量: $(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
-
       - name: Initialization Environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android $AGENT_TOOLSDIRECTORY
-          sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
-          sudo -E apt -yqq purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
           sudo -E apt -yqq update
           sudo -E apt -yqq install $(curl -fsSL is.gd/depends_ubuntu_2404)
-          sudo -E apt -yqq autoremove --purge
-          sudo -E apt -yqq autoclean
-          sudo -E apt -yqq clean
-          sudo -E systemctl daemon-reload
           sudo timedatectl set-timezone "$TZ"
-
-      - name: Combine Disks
-        run: |
-          MNT_SIZE=$((($(df --block-size=1024 --output=avail /mnt | tail -1) - 1024*1024*1) * 1024))
-          sudo fallocate -l $MNT_SIZE /mnt/mnt.img
-          MNT_NAME=$(sudo losetup -Pf --show /mnt/mnt.img)
-          sudo pvcreate -f $MNT_NAME
-          ROOT_SIZE=$((($(df --block-size=1024 --output=avail / | tail -1) - 1024*1024*4) * 1024))
-          sudo fallocate -l $ROOT_SIZE /root.img
-          ROOT_NAME=$(sudo losetup -Pf --show /root.img)
-          sudo pvcreate -f $ROOT_NAME
-          sudo vgcreate actions $MNT_NAME $ROOT_NAME
-          sudo lvcreate -n disk -l 100%FREE actions
-          LV_NAME=$(sudo lvscan | awk -F "'" '{print $2}')
-          sudo mkfs.btrfs -L combinedisk $LV_NAME
           sudo mkdir -p /workdir
-          sudo mount -o compress=zstd $LV_NAME /workdir
-          sudo chown -R runner:runner /workdir && df -hT
+          sudo chown runner:runner /workdir
 
-      - name: Load Custom Script
-        run: chmod +x $DIY_SCRIPT && ./$DIY_SCRIPT
+      - name: Clone Source Code
+        run: |
+          if [ "${{ inputs.source }}" == "immwrt" ]; then
+            REPO_URL="https://github.com/immortalwrt/immortalwrt"
+          else
+            REPO_URL="https://github.com/coolsnowwolf/lede"
+          fi
+          # 尝试克隆指定版本，增加 --tags 确保能找到具体版本号
+          git clone --depth 1 --tags -b $REPO_BRANCH $REPO_URL /workdir/openwrt
+          echo "OPENWRT_PATH=/workdir/openwrt" >> $GITHUB_ENV
+          echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
-      - name: Compile Toolchain
-        if: env.REBUILD_TOOLCHAIN == 'true'
-        id: toolchain
+      - name: Get Commit Data
         run: |
           cd $OPENWRT_PATH
-          make toolchain/compile -j$(nproc) || make toolchain/compile -j1 V=s
-          $GITHUB_WORKSPACE/$DIY_SCRIPT
+          # 抓取当前源码的元数据，用于填充 Release 页面
+          echo "COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an')" >> $GITHUB_ENV
+          echo "COMMIT_DATE=$(git log -1 --pretty=format:'%ad')" >> $GITHUB_ENV
+          echo "COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')" >> $GITHUB_ENV
+          echo "COMMIT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+          # 提取 Makefile 中的内核版本号
+          echo "KERNEL_VERSION=$(grep -oP '(?<=KERNEL_PATCHVER:=).*' target/linux/x86/Makefile || echo "Unknown")" >> $GITHUB_ENV
 
-      - name: Delete Old Toolchain
-        if: steps.toolchain.conclusion == 'success' || env.OUTPUT_RELEASE == 'true'
-        uses: mknejp/delete-release-assets@v1
-        with:
-          token: ${{secrets.GITHUB_TOKEN}}
-          tag: toolchain-cache
-          assets: '${{env.SOURCE_REPO}}-${{env.LITE_BRANCH}}-${{env.DEVICE_TARGET}}*'
-          fail-if-no-assets: false
-          fail-if-no-release: false
-
-      - name: Upload Toolchain To Release
-        if: steps.toolchain.conclusion == 'success' || env.OUTPUT_RELEASE == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          name: toolchain-cache
-          tag_name: toolchain-cache
-          token: ${{secrets.GITHUB_TOKEN}}
-          files: output/*
-          body: OpenWrt 工具链缓存
-
-      - name: Download DL Packages
+      - name: Load Custom Configuration
         run: |
+          CONFIG_FILE="configs/${{inputs.target}}-${{inputs.source}}.config"
+          [ -e $CONFIG_FILE ] && cp $CONFIG_FILE $OPENWRT_PATH/.config
+          
+          chmod +x $DIY_SCRIPT && ./$DIY_SCRIPT
+          
           cd $OPENWRT_PATH
-          # make download -j$(nproc)
-          make package/download -j$(nproc)
+          # 自动修改 800MB rootfs 空间
+          sed -i "s/CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=$PART_SIZE/" .config
+          # 自动修改默认 IP 地址
+          sed -i "s/192.168.1.1/$IP_ADDRESS/g" package/base-files/files/bin/config_generate
 
       - name: Compile Firmware
         id: compile
         run: |
           cd $OPENWRT_PATH
-          mkdir -p files/etc/uci-defaults
-          cp $GITHUB_WORKSPACE/scripts/init-settings.sh files/etc/uci-defaults/99-init-settings
-          echo -e "$(nproc) thread compile"
+          make defconfig
           make -j$(nproc) || make -j1 V=s
-          echo "FILE_DATE=$(date +"%Y.%m.%d")" >>$GITHUB_ENV
-          echo "DATE=$(date +"%Y.%m.%d-%H:%M:%S")" >>$GITHUB_ENV
-
-      - name: Organize Files
-        if: steps.compile.conclusion == 'success'
-        run: |
-          df -hT
-          echo "==============================="
-          ls $OPENWRT_PATH/bin/targets/*/*
-          echo "==============================="
-          cd $OPENWRT_PATH/bin/targets/*/*
-          sed '/^$/d' $OPENWRT_PATH/.config >config.txt
-          cat config.buildinfo
-          cp -rf $OPENWRT_PATH/bin/packages/* packages
-          tar -zcf packages.tar.gz packages
-          sleep 3s && rm -rf packages sha256sums *.buildinfo *.bin *.json *rootfs.img.gz
-          echo "FIRMWARE_PATH=$PWD" >>$GITHUB_ENV
-
-      - name: Upload Firmware To Artifact
-        if: steps.compile.conclusion == 'success' && env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/upload-artifact@main
-        with:
-          name: ${{env.SOURCE_REPO}}-${{env.LITE_BRANCH}}-${{env.DEVICE_TARGET}}-firmware-${{env.FILE_DATE}}
-          path: ${{env.FIRMWARE_PATH}}
+          echo "DATE=$(date +"%Y.%m.%d-%H:%M")" >> $GITHUB_ENV
+          echo "status=success" >> $GITHUB_OUTPUT
 
       - name: Upload Firmware To Release
-        if: steps.compile.conclusion == 'success' && env.UPLOAD_RELEASE == 'true'
+        if: steps.compile.outputs.status == 'success' && inputs.release == 'true'
         uses: ncipollo/release-action@main
         with:
-          name: ${{env.RELEASE_TAG}}-${{env.DATE}}
-          allowUpdates: true
-          removeArtifacts: true
-          tag: ${{env.RELEASE_TAG}}
-          token: ${{secrets.GITHUB_TOKEN}}
-          artifacts: ${{env.FIRMWARE_PATH}}/*
+          name: ${{ inputs.target }}-${{ env.REPO_BRANCH }}-${{ env.DATE }}
+          tag: ${{ inputs.target }}-${{ env.REPO_BRANCH }}-${{ env.DATE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ${{ env.OPENWRT_PATH }}/bin/targets/${{ inputs.target }}/*/*
           body: |
-            **This is ${{env.SOURCE_REPO}} firmware for ${{env.DEVICE_TARGET}}**
+            **这是基于 ${{ env.REPO_BRANCH }} 版本编译的固件**
             ### 📒 固件信息
-            - 💻 平台架构: ${{env.DEVICE_TARGET}}
-            - ⚽ 固件源码: ${{env.REPO_URL}}
-            - 💝 源码分支: ${{env.REPO_BRANCH}}
-            - 🚀 内核版本: ${{env.KERNEL_VERSION}}
-            - 🌐 默认地址: ${{env.IP_ADDRESS}}
+            - 💻 平台架构: ${{ inputs.target }}
+            - ⚽ 固件源码: ${{ env.REPO_URL }}
+            - 💝 源码分支: ${{ env.REPO_BRANCH }}
+            - 🚀 内核版本: ${{ env.KERNEL_VERSION }}
+            - 🌐 默认地址: ${{ env.IP_ADDRESS }}
             - 🔑 默认密码: password
-            ### 🧊 固件版本
-            - 固件编译前最后一次➦[主源码](${{env.REPO_URL}})更新记录
-            - ${{env.COMMIT_AUTHOR}}
-            - ${{env.COMMIT_DATE}}
-            - ${{env.COMMIT_MESSAGE}}
-            - ${{env.COMMIT_HASH}}
+            ### 🧊 源码最新记录
+            - **作者**: ${{ env.COMMIT_AUTHOR }}
+            - **日期**: ${{ env.COMMIT_DATE }}
+            - **摘要**: ${{ env.COMMIT_MESSAGE }}
+            - **哈希**: ${{ env.COMMIT_HASH }}
