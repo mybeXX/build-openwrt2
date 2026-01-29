@@ -13,7 +13,7 @@ on:
       version:
         description: '输入版本号 (例如: 24.10.4, v23.05.7, 或 master)'
         required: true
-        default: '24.10.4' # 设置默认版本为 24.10.4
+        default: '24.10.4'
         type: string
 
       target:
@@ -31,7 +31,7 @@ on:
       partsize:
         description: '设置rootfs大小 (MB)'
         required: false
-        default: '500' # 默认 rootfs 大小改为 500
+        default: '500'
 
       release:
         description: '上传到 Releases'
@@ -72,14 +72,20 @@ jobs:
           else
             REPO_URL="https://github.com/coolsnowwolf/lede"
           fi
-          git clone --depth 1 --tags -b $REPO_BRANCH $REPO_URL /workdir/openwrt
+          
+          # 先浅克隆 master，然后获取标签并切换，解决 128 错误
+          git clone --depth 1 $REPO_URL /workdir/openwrt
+          cd /workdir/openwrt
+          git fetch --tags
+          # 尝试直接切换或加 v 前缀切换
+          git checkout $REPO_BRANCH || git checkout v$REPO_BRANCH || echo "Using default branch"
+          
           echo "OPENWRT_PATH=/workdir/openwrt" >> $GITHUB_ENV
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
       - name: Get Commit Data
         run: |
           cd $OPENWRT_PATH
-          # 抓取源码信息，解决 Release 页面输出不全的问题
           echo "COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an')" >> $GITHUB_ENV
           echo "COMMIT_DATE=$(git log -1 --pretty=format:'%ad')" >> $GITHUB_ENV
           echo "COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')" >> $GITHUB_ENV
@@ -88,16 +94,11 @@ jobs:
 
       - name: Load Custom Configuration
         run: |
-          CONFIG_FILE="configs/${{inputs.target}}-${{inputs.source}}.config"
-          [ -e $CONFIG_FILE ] && cp $CONFIG_FILE $OPENWRT_PATH/.config
-          
-          chmod +x $DIY_SCRIPT && ./$DIY_SCRIPT
-          
+          # 这里的操作会触发下方的 immwrt.sh 脚本
+          [ -e "configs/${{inputs.target}}-${{inputs.source}}.config" ] && cp "configs/${{inputs.target}}-${{inputs.source}}.config" $OPENWRT_PATH/.config
+          chmod +x $DIY_SCRIPT
           cd $OPENWRT_PATH
-          # 自动修改 rootfs 空间
-          sed -i "s/CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=$PART_SIZE/" .config
-          # 自动修改默认 IP
-          sed -i "s/192.168.1.1/$IP_ADDRESS/g" package/base-files/files/bin/config_generate
+          $GITHUB_WORKSPACE/$DIY_SCRIPT
 
       - name: Compile Firmware
         id: compile
@@ -112,16 +113,16 @@ jobs:
         if: steps.compile.outputs.status == 'success' && inputs.release == 'true'
         uses: ncipollo/release-action@main
         with:
-          name: ${{ inputs.target }}-${{ env.REPO_BRANCH }}-${{ env.DATE }}
-          tag: ${{ inputs.target }}-${{ env.REPO_BRANCH }}-${{ env.DATE }}
+          name: ${{ inputs.target }}-${{ inputs.version }}-${{ env.DATE }}
+          tag: ${{ inputs.target }}-${{ inputs.version }}-${{ env.DATE }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: ${{ env.OPENWRT_PATH }}/bin/targets/${{ inputs.target }}/*/*
           body: |
-            **这是基于 ${{ env.REPO_BRANCH }} 版本编译的固件**
+            **这是基于 ${{ inputs.version }} 版本编译的固件**
             ### 📒 固件信息
             - 💻 平台架构: ${{ inputs.target }}
             - ⚽ 固件源码: ${{ env.REPO_URL }}
-            - 💝 源码分支: ${{ env.REPO_BRANCH }}
+            - 💝 源码分支: ${{ inputs.version }}
             - 🚀 内核版本: ${{ env.KERNEL_VERSION }}
             - 🌐 默认地址: ${{ env.IP_ADDRESS }}
             - 🔑 默认密码: password
